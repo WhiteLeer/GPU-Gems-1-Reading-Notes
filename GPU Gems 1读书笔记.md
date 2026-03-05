@@ -687,7 +687,124 @@ d(sin θ₁ - sin θ₂) = nλ
 
 #### 核心概念
 
-点光源的全向阴影贴图扩展。
+点光源的全向阴影贴图（Omnidirectional Shadow Mapping），解决单一深度贴图只能覆盖方向光源的局限。
+
+#### 我的理解
+
+**问题**：标准Shadow Map只能从单一方向投影，点光源需要全向覆盖。
+
+#### 解决方案：Cube Map Shadow
+
+**核心思路**：使用立方体贴图（6个面）存储全向深度。
+
+```cpp
+// 1. 生成阶段（从点光源渲染6次）
+for (int face = 0; face < 6; face++) {
+    // 设置立方体贴图面的视角
+    Matrix4 view = GetCubeFaceView(lightPos, face);
+    Matrix4 proj = PerspectiveProj(90, 1.0, nearPlane, farPlane);  // 90°FOV覆盖一个面
+
+    SetRenderTarget(shadowCubeMap, face);
+    SetViewProj(view, proj);
+
+    // 渲染场景深度
+    RenderSceneDepthOnly();
+}
+```
+
+**立方体面方向**：
+```
+Face 0: +X (right)
+Face 1: -X (left)
+Face 2: +Y (up)
+Face 3: -Y (down)
+Face 4: +Z (forward)
+Face 5: -Z (back)
+```
+
+#### Shader实现
+
+```hlsl
+// 顶点着色器：计算世界空间位置
+struct VS_OUTPUT {
+    float4 pos : POSITION;
+    float3 worldPos : TEXCOORD0;
+};
+
+VS_OUTPUT VS_Main(float3 position : POSITION) {
+    VS_OUTPUT output;
+    output.pos = mul(float4(position, 1.0), WorldViewProj);
+    output.worldPos = mul(float4(position, 1.0), World).xyz;
+    return output;
+}
+
+// 像素着色器：采样立方体阴影贴图
+samplerCUBE shadowCube : register(s0);
+float3 lightPos;
+float lightFarPlane;
+
+float4 PS_Main(VS_OUTPUT input) : COLOR {
+    // 1. 计算从光源到片元的向量
+    float3 lightToFrag = input.worldPos - lightPos;
+
+    // 2. 采样立方体贴图获取存储的深度
+    float closestDepth = texCUBE(shadowCube, lightToFrag).r;
+
+    // 3. 计算当前片元深度
+    float currentDepth = length(lightToFrag);
+
+    // 4. 深度比较
+    float shadow = (currentDepth - bias > closestDepth) ? 0.0 : 1.0;
+
+    // 5. 应用光照
+    float3 lighting = ComputeLighting(...) * shadow;
+    return float4(lighting, 1.0);
+}
+```
+
+#### 性能优化
+
+**1. 多Pass渲染开销**：
+```
+标准Shadow Map：1次场景渲染
+Cube Shadow Map：6次场景渲染（6个面）
+→ 渲染开销增加6倍
+```
+
+**优化策略**：
+- 降低立方体贴图分辨率（512×512 vs 2048×2048平面阴影）
+- 仅在点光源附近物体渲染
+- 多个点光源共享立方体贴图池
+- 使用几何着色器一次性渲染到6个面（GeForce 8+）
+
+**2. 深度存储**：
+```hlsl
+// 线性化深度存储（而非透视深度）
+float depth = length(worldPos - lightPos);
+depth = depth / lightFarPlane;  // 归一化到[0,1]
+return float4(depth, depth, depth, depth);
+```
+
+#### 与Dual-Paraboloid对比
+
+| 特性 | **Cube Map** | **Dual-Paraboloid** |
+|------|--------------|---------------------|
+| **采样面数** | 6 | 2 |
+| **渲染开销** | 高（6个Pass） | 中（2个Pass） |
+| **接缝问题** | 轻微（边缘） | ⚠️ 明显（赤道） |
+| **采样简单性** | ✅ texCUBE | ❌ 需要特殊计算 |
+| **视口变形** | ✅ 无 | ⚠️ 抛物面变形 |
+| **现代支持** | ✅ 主流选择 | ⚠️ 较少使用 |
+
+#### 现代应用
+
+```
+现代引擎中：
+- Cube Shadow Map仍是点光源阴影标准方案
+- 结合PCF/VSM实现软阴影
+- 使用Geometry Shader优化渲染（一个Pass输出6个面）
+- Unity/Unreal的点光源阴影默认使用Cube Shadow Map
+```
 
 ---
 
@@ -696,16 +813,421 @@ d(sin θ₁ - sin θ₂) = nλ
 
 #### 核心概念
 
-静态场景中动态光源的软阴影技术。
+使用遮挡区间贴图（Occlusion Interval Maps）实现静态场景中动态面光源的软阴影。
+
+#### 我的理解
+
+**软阴影原理**：
+- 面光源（Area Light）产生半影（Penumbra）
+- 每个表面点被光源的不同部分遮挡
+- 需要对光源表面积分
+
+**传统方法问题**：
+- 光线追踪：每个像素数百条光线，实时不可行
+- Shadow Map：只能产生硬阴影
+
+#### Occlusion Interval Maps原理
+
+**核心思路**：预计算遮挡信息，运行时快速查询。
+
+**1. 遮挡区间定义**：
+
+```
+对于表面点P和线性光源L（1D）：
+- 遍历遮挡物边界
+- 记录光源上被遮挡的区间
+
+示例：
+光源：[0.0, 1.0]
+遮挡物A遮挡：[0.2, 0.4]
+遮挡物B遮挡：[0.6, 0.8]
+→ 可见区间：[0.0, 0.2], [0.4, 0.6], [0.8, 1.0]
+→ 可见度 = 0.2 + 0.2 + 0.2 = 0.6（60%光照）
+```
+
+**2. 区间贴图存储**：
+
+```cpp
+struct OcclusionInterval {
+    float start;   // 区间起点
+    float end;     // 区间终点
+};
+
+// 每个纹素存储遮挡区间链表
+// 使用多个纹理通道或链表结构
+```
+
+#### 算法流程
+
+**预计算阶段**（静态场景）：
+
+```cpp
+void PrecomputeOcclusionIntervals() {
+    for (each surface point P) {
+        List<OcclusionInterval> intervals;
+
+        // 1. 投影场景到光源空间
+        for (each occluder edge E) {
+            // 计算E在光源上的投影
+            float2 proj = ProjectEdgeOntoLight(P, E, lightPlane);
+
+            // 添加遮挡区间
+            intervals.Add({proj.x, proj.y});
+        }
+
+        // 2. 合并重叠区间
+        intervals = MergeIntervals(intervals);
+
+        // 3. 存储到纹理
+        StoreIntervalsToTexture(P, intervals);
+    }
+}
+```
+
+**实时渲染阶段**：
+
+```hlsl
+// 像素着色器：查询遮挡区间
+sampler2D occlusionMap : register(s0);
+
+float4 PS_SoftShadow(float2 texCoord : TEXCOORD0, float3 worldPos : TEXCOORD1) : COLOR {
+    // 1. 从纹理读取遮挡区间
+    float4 interval1 = tex2D(occlusionMap, texCoord);  // [start1, end1, start2, end2]
+
+    // 2. 计算可见区间长度
+    float visible = 0.0;
+    float totalLength = 1.0;  // 光源归一化长度
+
+    // 排除遮挡区间
+    visible = totalLength - (interval1.y - interval1.x) - (interval1.w - interval1.z);
+
+    // 3. 可见度 = 可见区间 / 总长度
+    float visibility = saturate(visible / totalLength);
+
+    // 4. 应用光照
+    float3 lighting = ComputeLighting(worldPos, lightPos);
+    return float4(lighting * visibility, 1.0);
+}
+```
+
+#### 扩展到2D面光源
+
+**方法**：将面光源分解为多个线性光源。
+
+```
+矩形光源分解：
+- 水平方向：N条线性光源
+- 每条线应用1D遮挡区间算法
+- 结果沿垂直方向积分
+
+visibility_2D = (1/N) * Σ visibility_1D(i)
+```
+
+```hlsl
+float ComputeSoftShadow2D(float2 texCoord, float3 worldPos) {
+    float totalVisibility = 0.0;
+    int numSamples = 8;  // 光源细分数量
+
+    for (int i = 0; i < numSamples; i++) {
+        // 采样光源的不同位置
+        float u = (i + 0.5) / numSamples;
+        float3 sampleLightPos = lightPosMin + u * (lightPosMax - lightPosMin);
+
+        // 查询该位置的遮挡区间
+        float visibility = QueryOcclusionInterval(texCoord, sampleLightPos);
+        totalVisibility += visibility;
+    }
+
+    return totalVisibility / numSamples;
+}
+```
+
+#### 优缺点分析
+
+**优点**：
+```
+✅ 静态场景预计算，运行时非常快
+✅ 动态光源位置（在预定义范围内移动）
+✅ 软阴影质量高（准确的半影）
+✅ 无需多次采样Shadow Map
+```
+
+**缺点**：
+```
+❌ 仅适用于静态场景（遮挡物不能移动）
+❌ 预计算存储开销大（每个表面点的区间链表）
+❌ 动态物体需要其他技术补充
+❌ 复杂场景遮挡区间过多（纹理容量限制）
+```
+
+#### 存储优化
+
+**压缩策略**：
+```cpp
+// 1. 限制最大区间数量（丢弃小区间）
+const int MAX_INTERVALS = 4;
+
+// 2. 使用浮点纹理存储
+R32G32B32A32_FLOAT: [start1, end1, start2, end2]
+
+// 3. 区间链表（使用间接纹理）
+struct IntervalNode {
+    float2 interval;
+    uint next;  // 链表指针
+};
+```
+
+#### 与其他软阴影技术对比
+
+| 技术 | **实时性** | **动态场景** | **质量** | **复杂度** |
+|------|-----------|-------------|---------|-----------|
+| **Ray Tracing** | ❌ 慢 | ✅ | ⭐⭐⭐⭐⭐ | 高 |
+| **PCSS** | ⚠️ 中 | ✅ | ⭐⭐⭐⭐ | 中 |
+| **VSM** | ✅ 快 | ✅ | ⭐⭐⭐ | 低 |
+| **Occlusion Intervals** | ✅ 最快 | ❌ 静态 | ⭐⭐⭐⭐ | 高（预计算） |
+
+#### 适用场景
+
+```
+理想应用：
+- 建筑可视化（静态建筑 + 动态光照）
+- 室内场景（日光模拟）
+- 预渲染背景 + 动态角色（混合技术）
+
+不适用：
+- 开放世界游戏（大量动态物体）
+- 破坏系统（场景结构改变）
+```
 
 ---
 
-### Chapter 14: Perspective Shadow Maps
+### Chapter 14: Perspective Shadow Maps (PSM)
 **作者**: Simon Kozlov
 
 #### 核心概念
 
-透视阴影贴图优化，减少走样。
+透视阴影贴图（Perspective Shadow Maps, PSM）通过后透视变换优化深度贴图分辨率分配，减少透视走样。
+
+#### 我的理解
+
+**标准Shadow Map的问题**：
+
+```
+透视走样（Perspective Aliasing）：
+- 近处物体占据更多屏幕像素
+- 远处和近处使用相同的Shadow Map分辨率
+- 导致近处阴影块状化（undersampling）
+
+示例：
+        相机
+         |
+    近处 |         远处
+    ████ |         ▓
+    ████ |         ▓
+
+阴影贴图分辨率分配：
+    近处: 10 texels → 锯齿严重！
+    远处: 10 texels → 浪费分辨率
+```
+
+#### PSM核心思想
+
+**关键洞察**：从相机视角变换阴影贴图，使分辨率分配与屏幕空间像素密度匹配。
+
+**变换流程**：
+
+```
+标准Shadow Map：
+World Space → Light View Space → Light Proj Space → Shadow Map
+
+PSM：
+World Space → Light View Space → Camera View Space → Camera Proj Space → Shadow Map
+                                   ↑
+                              关键创新！
+```
+
+#### 算法详解
+
+**1. 标准Shadow Map渲染**：
+
+```cpp
+// 从光源视角渲染
+Matrix4 lightView = LookAt(lightPos, sceneCenter, up);
+Matrix4 lightProj = Ortho(bounds);  // 正交投影
+
+Matrix4 lightMatrix = lightProj * lightView;
+RenderDepth(lightMatrix);
+```
+
+**2. PSM渲染**：
+
+```cpp
+// 从光源视角变换到相机空间
+Matrix4 lightView = LookAt(lightPos, sceneCenter, up);
+
+// ⭐ 关键：应用相机的透视变换
+Matrix4 cameraView = GetCameraView();
+Matrix4 cameraProj = GetCameraProj();  // 相机的透视矩阵
+
+// 复合变换
+Matrix4 psmMatrix = cameraProj * cameraView * Inverse(lightView);
+
+RenderDepth(psmMatrix);
+```
+
+**几何意义**：
+```
+1. 将场景从光源空间变换到相机空间
+2. 应用相机的透视变换
+   → 近处物体被"放大"
+   → 远处物体被"缩小"
+3. 阴影贴图分辨率自动匹配屏幕空间密度
+```
+
+#### Shader实现
+
+```hlsl
+// 顶点着色器（PSM深度渲染）
+float4x4 psmMatrix;  // lightView^-1 * cameraView * cameraProj
+
+struct VS_OUTPUT {
+    float4 pos : POSITION;
+    float depth : TEXCOORD0;
+};
+
+VS_OUTPUT VS_PSM(float3 position : POSITION) {
+    VS_OUTPUT output;
+
+    // 应用PSM变换
+    float4 posLightSpace = mul(float4(position, 1.0), lightView);
+    output.pos = mul(posLightSpace, psmMatrix);
+
+    // 存储线性深度
+    output.depth = output.pos.z / output.pos.w;
+
+    return output;
+}
+
+float4 PS_PSM(VS_OUTPUT input) : COLOR {
+    return float4(input.depth, input.depth, input.depth, 1.0);
+}
+```
+
+```hlsl
+// 像素着色器（阴影采样）
+sampler2D psmShadowMap : register(s0);
+float4x4 psmMatrix;
+
+float4 PS_Main(float3 worldPos : TEXCOORD0) : COLOR {
+    // 1. 变换到PSM空间
+    float4 posLightSpace = mul(float4(worldPos, 1.0), lightView);
+    float4 posPSM = mul(posLightSpace, psmMatrix);
+
+    // 2. 透视除法
+    float3 projCoords = posPSM.xyz / posPSM.w;
+
+    // 3. 变换到纹理坐标[0,1]
+    projCoords = projCoords * 0.5 + 0.5;
+    projCoords.y = 1.0 - projCoords.y;  // 翻转Y
+
+    // 4. 采样深度
+    float closestDepth = tex2D(psmShadowMap, projCoords.xy).r;
+    float currentDepth = projCoords.z;
+
+    // 5. 深度测试
+    float shadow = (currentDepth - bias > closestDepth) ? 0.0 : 1.0;
+
+    // 应用光照
+    float3 lighting = ComputeLighting(worldPos, lightPos);
+    return float4(lighting * shadow, 1.0);
+}
+```
+
+#### 优缺点分析
+
+**优点**：
+```
+✅ 近处阴影质量显著提升
+✅ 无需额外内存开销
+✅ 算法简单，易于实现
+✅ 适合第三人称游戏（角色周围高分辨率）
+```
+
+**缺点**：
+```
+❌ 远处阴影质量下降（分辨率被"偷"给近处）
+❌ 仅在光源和相机方向接近时效果好
+❌ 边界裁剪问题（相机背后物体投影到无穷远）
+❌ 需要处理特殊情况（光源在相机后方）
+```
+
+#### 边界裁剪问题
+
+**问题描述**：
+```
+相机背后的物体通过透视变换投影到无穷远
+→ 阴影贴图需要覆盖无限范围
+→ 分辨率严重浪费或裁剪错误
+```
+
+**解决方案**：
+```cpp
+// 1. 裁剪相机视锥背后的物体
+if (Dot(lightDir, cameraForward) < 0) {
+    // 光源在相机后方，使用标准Shadow Map
+    return StandardShadowMap();
+}
+
+// 2. 限制近平面（避免极端变形）
+float nearClip = max(cameraNear, minNearPlane);
+Matrix4 clippedProj = PerspectiveProj(fov, aspect, nearClip, cameraFar);
+
+// 3. 使用裁剪平面
+// 仅渲染相机可见物体到阴影贴图
+```
+
+#### 与其他技术对比
+
+| 技术 | **近处质量** | **远处质量** | **复杂度** | **适用场景** |
+|------|------------|------------|-----------|-------------|
+| **标准Shadow Map** | ⭐⭐ | ⭐⭐⭐ | 低 | 通用 |
+| **PSM** | ⭐⭐⭐⭐⭐ | ⭐ | 低 | 角色周围 |
+| **CSM** | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | 中 | 大场景⭐ |
+| **PSSM** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 中 | 现代标准⭐ |
+
+#### 现代改进：LiSPSM
+
+**Light-Space Perspective Shadow Maps**（后续研究）：
+
+```
+改进：
+1. 考虑光源和相机的相对位置
+2. 自适应调整透视变换强度
+3. 解决边界裁剪问题
+
+核心公式：
+n' = lerp(n_uniform, n_perspective, weight)
+
+weight基于光源-相机夹角：
+- 夹角小（平行）：更多透视
+- 夹角大（垂直）：更少透视
+```
+
+#### 实际应用建议
+
+```cpp
+// 混合策略（现代引擎常用）
+if (IsCloseupScene() && IsLightInFront()) {
+    // 近景使用PSM
+    return PSM();
+} else {
+    // 其他情况使用CSM
+    return CascadedShadowMap();
+}
+
+// 或使用PSSM（结合CSM和PSM优点）
+return ParallelSplitShadowMaps();
+```
 
 ---
 
@@ -714,7 +1236,275 @@ d(sin θ₁ - sin θ₂) = nλ
 
 #### 核心概念
 
-可见性技术优化逐像素光照。
+使用可见性管理技术优化多光源逐像素光照的性能，避免对不可见或不受影响的像素进行昂贵的光照计算。
+
+#### 我的理解
+
+**多光源问题**：
+
+```
+场景：100个动态光源
+传统Forward Rendering：
+- 每个像素计算100次光照
+- 大量像素不受特定光源影响
+- 浪费计算资源
+
+示例：
+像素P在角落：
+- 距离光源L50: 100米（超出衰减范围）
+- 仍然计算光照 → 结果为0 → 浪费！
+
+性能：
+100个光源 × 1920×1080像素 = 2亿次光照计算/帧
+60 FPS → 120亿次/秒（不可行！）
+```
+
+#### 解决方案：光体积（Light Volumes）
+
+**核心思路**：仅对光源影响范围内的像素进行光照计算。
+
+**1. 光源包围体定义**：
+
+```cpp
+// 计算光源影响半径
+float ComputeLightRadius(PointLight light) {
+    // 基于衰减公式反推半径
+    // Attenuation = 1 / (constant + linear*d + quadratic*d²)
+    // 当Attenuation < threshold (如0.01)时截断
+
+    float threshold = 0.01;  // 1%亮度
+    float maxIntensity = max(light.color.r, light.color.g, light.color.b);
+
+    // 求解二次方程
+    float radius = (-light.linear + sqrt(light.linear * light.linear
+                    - 4 * light.quadratic * (light.constant - maxIntensity / threshold)))
+                   / (2 * light.quadratic);
+
+    return radius;
+}
+
+// 创建光源包围球
+Sphere lightVolume;
+lightVolume.center = light.position;
+lightVolume.radius = ComputeLightRadius(light);
+```
+
+**2. 使用模板缓冲（Stencil Buffer）标记**：
+
+```cpp
+// Multi-pass光照渲染
+void RenderLights(Scene scene, Camera camera) {
+    // Pass 1: 渲染场景几何（仅环境光）
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    RenderSceneAmbient(scene);
+
+    // Pass 2+: 为每个光源添加光照
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);  // 累加光照
+    glDepthMask(GL_FALSE);        // 不写入深度
+
+    for (Light light : scene.lights) {
+        // ⭐ 关键：渲染光源包围球
+        // 仅影响球内的像素
+
+        // 2a. 使用模板缓冲标记受影响像素
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_ALWAYS, 1, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+
+        RenderLightVolume(light);  // 渲染球体，标记模板
+
+        // 2b. 仅在标记像素执行光照计算
+        glStencilFunc(GL_EQUAL, 1, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+        RenderSceneWithLight(scene, light);  // 仅计算模板标记的像素
+
+        glClear(GL_STENCIL_BUFFER_BIT);
+    }
+}
+```
+
+#### Shader实现
+
+```hlsl
+// 顶点着色器：渲染光源包围球
+float4x4 WorldViewProj;
+
+float4 VS_LightVolume(float3 position : POSITION) : POSITION {
+    // 将光源包围球顶点变换到屏幕空间
+    return mul(float4(position, 1.0), WorldViewProj);
+}
+
+// 像素着色器：空（仅标记模板）
+float4 PS_LightVolume() : COLOR {
+    return float4(0, 0, 0, 0);  // 不写入颜色
+}
+```
+
+```hlsl
+// 像素着色器：逐像素光照（仅在模板标记区域执行）
+sampler2D normalMap : register(s0);
+sampler2D depthMap : register(s1);
+
+float3 lightPos;
+float3 lightColor;
+float lightRadius;
+
+float4 PS_PerPixelLight(float2 texCoord : TEXCOORD0, float3 viewRay : TEXCOORD1) : COLOR {
+    // 1. 从G-Buffer重建世界位置
+    float depth = tex2D(depthMap, texCoord).r;
+    float3 worldPos = cameraPos + viewRay * depth;
+
+    // 2. 计算光照方向和距离
+    float3 L = lightPos - worldPos;
+    float distance = length(L);
+    L = normalize(L);
+
+    // 3. 提前退出（在影响范围外）
+    if (distance > lightRadius) {
+        discard;  // 或return 0
+    }
+
+    // 4. 读取法线
+    float3 N = tex2D(normalMap, texCoord).xyz * 2.0 - 1.0;
+    N = normalize(N);
+
+    // 5. 计算光照
+    float NdotL = saturate(dot(N, L));
+    float attenuation = 1.0 / (1.0 + 0.1 * distance + 0.01 * distance * distance);
+
+    float3 lighting = lightColor * NdotL * attenuation;
+
+    return float4(lighting, 1.0);
+}
+```
+
+#### 优化策略对比
+
+**1. 无优化（Brute Force）**：
+```
+for each pixel:
+    for each light:
+        compute lighting  // 即使光照贡献为0
+
+成本：O(Pixels × Lights)
+```
+
+**2. 光源包围体（Light Volumes）**：
+```
+for each light:
+    mark affected pixels (stencil)
+    for each marked pixel:
+        compute lighting
+
+成本：O(Lights × AffectedPixels)
+AffectedPixels << TotalPixels
+```
+
+**3. 延迟着色（Deferred Shading）**：
+```
+Pass 1: Render G-Buffer (geometry only)
+Pass 2:
+    for each light:
+        render light volume
+        compute lighting for covered pixels
+
+成本：O(Pixels + Lights × AffectedPixels)
+```
+
+#### 与延迟着色的关系
+
+**本章技术是Deferred Lighting的前身**：
+
+```
+2004年（本章）：
+- Forward Rendering + Light Volumes
+- 使用模板缓冲优化
+- 每个光源仍需访问场景几何
+
+2007年+（现代Deferred）：
+- G-Buffer存储所有几何信息
+- 光照Pass完全解耦
+- 仅计算光照，无需几何数据
+```
+
+**核心相同点**：
+- 将光照计算限制在影响范围内
+- 使用包围体渲染
+- 多Pass累加光照
+
+#### 深度优化：Scissor Rect
+
+```cpp
+// 进一步优化：计算光源包围球的屏幕空间矩形
+Rect ComputeScissorRect(Sphere lightVolume, Camera camera) {
+    // 投影光源包围球到屏幕空间
+    Point2D projCenter = ProjectToScreen(lightVolume.center, camera);
+    float projRadius = ComputeProjectedRadius(lightVolume, camera);
+
+    // 计算屏幕空间矩形
+    return Rect(
+        projCenter.x - projRadius,
+        projCenter.y - projRadius,
+        projCenter.x + projRadius,
+        projCenter.y + projRadius
+    );
+}
+
+// 渲染时应用裁剪
+glEnable(GL_SCISSOR_TEST);
+glScissor(rect.x, rect.y, rect.width, rect.height);
+RenderSceneWithLight(scene, light);
+glDisable(GL_SCISSOR_TEST);
+```
+
+**效果**：
+```
+无Scissor：光源包围球覆盖100×100像素
+使用Scissor：仅处理80×80实际影响的像素
+→ 节省36%像素着色器调用
+```
+
+#### 性能分析
+
+**场景示例**：
+```
+分辨率：1920×1080 = 207万像素
+光源数：50个点光源
+平均影响：每个光源影响10%像素
+
+无优化：
+207万 × 50 = 1.035亿光照计算
+
+Light Volumes优化：
+207万 × 0.1 × 50 = 1035万光照计算
+→ 减少90%计算量！
+```
+
+#### 现代应用
+
+```
+本章技术演变为：
+1. Deferred Lighting（Light Pre-Pass）
+   - Killzone 2 (2009)
+   - 分离几何和光照
+
+2. Deferred Shading
+   - CryEngine 3+, Unreal Engine 4+
+   - 完整G-Buffer
+   - 现代游戏标配
+
+3. Clustered Lighting
+   - 将屏幕空间分割为3D格子
+   - 每个格子记录影响的光源
+   - Doom 2016, 现代引擎
+
+核心思想不变：
+"不要计算看不见或无影响的光照"
+```
 
 ---
 
